@@ -1,0 +1,653 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local LocalPlayer = Players.LocalPlayer
+
+-- Behavior Controls
+local BEHAVIORS = {
+	ENABLE_BACK_MOVEMENT = true, -- backshots
+	ENABLE_FRONT_MOVEMENT = true, -- frontshots
+	ENABLE_INCHING = true, -- if the we can inch toward/away from players
+	ENABLE_HEAD_NODDING = true, -- if we can head nod whilst player is looking
+	ENABLE_PATTERN_DETECTION = true, -- detection if player is moving back n forth behind us
+	ENABLE_ITEM_HANDLING = true, -- tool equipping - switching
+	ENABLE_SEAT_HANDLING = true, -- perferibly set to on - prevents the player from remaining seated
+}
+
+local ITEMS_TO_EQUIP = {
+	"Pizza",
+	"Burger",
+	"Newspaper",
+	"Soda",
+}
+
+-- Configuration
+local timeout = 0.01 -- Back and forth speed
+local RADIUS = 4 -- Radius behind the player
+local BACK_DISTANCE = 4 -- How far behind the player
+local FRONT_DISTANCE = 4 -- How far in front of the player
+local CLOSE_DISTANCE_MIN = 0.1
+local CLOSE_DISTANCE_MAX = 0.25
+local LOOK_DETECTION_RADIUS = 20 -- Distance to detect if target is looking at us
+local LOOK_ANGLE_THRESHOLD = math.rad(85)
+local MINIMUM_DISTANCE_TO_TARGET = 2 -- Minimum distance to maintain
+local INCH_AMOUNT = 2 -- How far to inch towards the player
+local INCH_INTERVAL_MIN = 0.1 -- Delay between inching
+local INCH_INTERVAL_MAX = 2
+local INITIAL_WAIT_MIN = 0.5 -- Delay while player is looking
+local INITIAL_WAIT_MAX = 8
+local ITEM_SWITCH_INTERVAL_MIN = 5 -- Time between switching items
+local ITEM_SWITCH_INTERVAL_MAX = 15
+local TOOL_ACTIVATE_CHANCE = 0.3
+local TOOL_ACTIVATE_CHECK_INTERVAL = 1 -- Checks if tool can activate
+local REVERSE_BEHAVIOR_CHANCE = 0.3 -- Chance to look at player instead of away
+local BACKWARDS_INCH_AMOUNT = 2 -- How far to inch backwards
+local BACKWARDS_MINIMUM_DISTANCE = 8
+local FRONT_MOVEMENT_CHANCE = 0.05
+local TARGET_SWITCH_TIME_MIN = 3
+local TARGET_SWITCH_TIME_MAX = 15
+
+local MOVEMENT_CHECK_INTERVAL = 0.5 -- How often to check target's movement
+local MOVEMENT_HISTORY_LENGTH = 10 -- How many position samples to keep
+local PATTERN_DETECTION_THRESHOLD = 6 -- How many movements need to be in range to trigger
+local SMALL_MOVEMENT_RANGE = {min = 0.1, max = 1}
+local LARGE_MOVEMENT_RANGE = {min = 3, max = 5}
+
+local REACTION_CHANCE = 0.5
+local HEAD_NOD_CHANCE = 0.3
+local HEAD_NOD_SPEED = 2
+local HEAD_NOD_DURATION = 2
+local HEAD_NOD_ANGLE = math.rad(30)
+
+-- Movement states
+local isMovingBack = true
+local isMoving = false
+local beingLookedAt = false
+local isInchingEnabled = false
+local isReverseBehavior = false
+local isFrontMovementEnabled = false
+local lastInchTime = 0
+local inchingInProgress = false
+local currentEquippedItem = nil
+local lastItemSwitch = 0
+local lastActivateCheck = 0
+local lastSeatChange = 0
+local lastMovementCheck = 0
+local movementHistory = {}
+local smallRangeCount = 0
+local largeRangeCount = 0
+local lastTargetPosition = nil
+local headNodStartTime = 0
+local lastJumpAttempt = 0
+local jumpAttemptsCount = 0
+local currentTarget = nil
+local lastVisibilityCheck = 0
+local currentBehaviorState = "none"
+local lastTargetSwitch = 0
+local targetSwitchDelay = 0
+
+local RAYCAST_CONFIG = {
+	JUMP_COOLDOWN = 0.5,
+	JUMP_CHANCE = 0.3,
+	RAYCAST_DISTANCE = 2,
+	RAYCAST_PARAMS = RaycastParams.new()
+}
+
+
+RAYCAST_CONFIG.RAYCAST_PARAMS.FilterType = Enum.RaycastFilterType.Exclude
+
+local function GetCharacterComponents()
+	local Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+	local Humanoid = Character:FindFirstChild("Humanoid") or Character:WaitForChild("Humanoid")
+	local HumanoidRootPart
+	repeat
+		HumanoidRootPart = Character:FindFirstChild("HumanoidRootPart")
+		task.wait()
+	until HumanoidRootPart
+	return Character, Humanoid, HumanoidRootPart
+end
+
+local Character, Humanoid, HumanoidRootPart = GetCharacterComponents()
+local bodyGyro = Instance.new("BodyGyro")
+bodyGyro.MaxTorque = Vector3.new(0, math.huge, 0)
+bodyGyro.P = 10000
+bodyGyro.D = 100
+bodyGyro.Parent = HumanoidRootPart
+
+local function UnequipCurrentItem()
+	if not BEHAVIORS.ENABLE_ITEM_HANDLING then return end
+	if currentEquippedItem then
+		local backpack = LocalPlayer:FindFirstChild("Backpack")
+		if backpack then
+			currentEquippedItem.Parent = backpack
+			currentEquippedItem = nil
+		end
+	end
+end
+
+local function EquipRandom()
+	if not BEHAVIORS.ENABLE_ITEM_HANDLING then return end
+	local backpack = LocalPlayer:FindFirstChild("Backpack")
+	if not backpack then return end
+	local availableItems = {}
+	for _, itemName in ipairs(ITEMS_TO_EQUIP) do
+		local item = backpack:FindFirstChild(itemName)
+		if item then
+			table.insert(availableItems, item)
+		end
+	end
+	if #availableItems > 0 then
+		if currentEquippedItem then
+			currentEquippedItem.Parent = backpack
+		end
+		local randomItem = availableItems[math.random(1, #availableItems)]
+		randomItem.Parent = Character
+		currentEquippedItem = randomItem
+		lastItemSwitch = tick()
+	end
+end
+
+local function ItemHandler()
+	if not BEHAVIORS.ENABLE_ITEM_HANDLING then return end
+	if not beingLookedAt then
+		UnequipCurrentItem()
+		return
+	end
+	local timeSinceLastSwitch = tick() - lastItemSwitch
+	local randomInterval = ITEM_SWITCH_INTERVAL_MIN + (math.random() * (ITEM_SWITCH_INTERVAL_MAX - ITEM_SWITCH_INTERVAL_MIN))
+	if timeSinceLastSwitch >= randomInterval then
+		EquipRandom()
+	end
+	if currentEquippedItem and tick() - lastActivateCheck >= TOOL_ACTIVATE_CHECK_INTERVAL then
+		lastActivateCheck = tick()
+		if math.random() <= TOOL_ACTIVATE_CHANCE then
+			if typeof(currentEquippedItem.Activate) == "function" then
+				pcall(function()
+					currentEquippedItem:Activate()
+				end)
+			end
+		end
+	end
+end
+
+local function HandleSeatedState()
+	if not BEHAVIORS.ENABLE_SEAT_HANDLING then return end
+	local currentTime = tick()
+	if LocalPlayer.Character and LocalPlayer.Character.Humanoid.Sit and currentTime - lastSeatChange > 1 then
+		task.wait()
+		LocalPlayer.Character.Humanoid.Jump = true
+		lastSeatChange = currentTime
+	end
+end
+
+local function CheckForObstacles()
+	if not HumanoidRootPart then return false end
+	local playersToExclude = {}
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player.Character then
+			table.insert(playersToExclude, player.Character)
+		end
+	end
+	RAYCAST_CONFIG.RAYCAST_PARAMS.FilterDescendantsInstances = playersToExclude
+	local rayOrigin = HumanoidRootPart.Position
+	local rayDirection = HumanoidRootPart.CFrame.LookVector * RAYCAST_CONFIG.RAYCAST_DISTANCE
+
+	local raycastResult = workspace:Raycast(rayOrigin, rayDirection, RAYCAST_CONFIG.RAYCAST_PARAMS)
+	if raycastResult then
+		if tick() - lastJumpAttempt >= RAYCAST_CONFIG.JUMP_COOLDOWN then
+			if math.random() <= RAYCAST_CONFIG.JUMP_CHANCE then
+				lastJumpAttempt = tick()
+				Humanoid.Jump = true
+			end
+		end
+		return true
+	end
+	return false
+end
+
+local function GetNearestPlayer()
+	local currentTime = tick()
+	if currentTarget and currentTime - lastTargetSwitch < targetSwitchDelay then
+		if currentTarget.Character then
+			local targetHumanoid = currentTarget.Character:FindFirstChild("Humanoid")
+			local targetRoot = currentTarget.Character:FindFirstChild("HumanoidRootPart")
+			if targetRoot and targetHumanoid and targetHumanoid.Health > 0 then
+				return currentTarget
+			end
+		end
+	end
+	local validTargets = {}
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer and player.Character then
+			local targetHumanoid = player.Character:FindFirstChild("Humanoid")
+			local targetRoot = player.Character:FindFirstChild("HumanoidRootPart")
+			if targetRoot and targetHumanoid and targetHumanoid.Health > 0 then
+				local distance = (targetRoot.Position - HumanoidRootPart.Position).Magnitude
+				if distance <= LOOK_DETECTION_RADIUS then
+					table.insert(validTargets, {
+						player = player,
+						distance = distance
+					})
+				end
+			end
+		end
+	end
+	if #validTargets > 0 then
+		table.sort(validTargets, function(a, b)
+			return a.distance < b.distance
+		end)
+		local selectionPool = math.min(3, #validTargets)
+		local selectedIndex = math.random(1, selectionPool)
+		currentTarget = validTargets[selectedIndex].player
+		lastTargetSwitch = currentTime
+		targetSwitchDelay = TARGET_SWITCH_TIME_MIN + (math.random() * (TARGET_SWITCH_TIME_MAX - TARGET_SWITCH_TIME_MIN))
+		return currentTarget
+	end
+	currentTarget = nil
+	return nil
+end
+
+local function IsTargetVisible(target)
+	if not target or not target.Character then return false end
+	local targetRoot = target.Character:FindFirstChild("HumanoidRootPart")
+	if not targetRoot then return false end
+	
+	local distance = (targetRoot.Position - HumanoidRootPart.Position).Magnitude
+	return distance < 50
+end
+
+local function AttemptJump()
+	if tick() - lastJumpAttempt < RAYCAST_CONFIG.JUMP_COOLDOWN then return end
+	lastJumpAttempt = tick()
+	jumpAttemptsCount = jumpAttemptsCount + 1
+	task.wait()
+	Humanoid.Jump = true
+end
+
+local function HandleTargetVisibility(target)
+	if not target then return false end
+	if tick() - lastVisibilityCheck < RAYCAST_CONFIG.VISIBILITY_CHECK_INTERVAL then
+		return IsTargetVisible(currentTarget)
+	end
+	lastVisibilityCheck = tick()
+	local isVisible = IsTargetVisible(target)
+	if not isVisible then
+		if jumpAttemptsCount < RAYCAST_CONFIG.MAX_JUMP_ATTEMPTS then
+			AttemptJump()
+			return true
+		else
+			jumpAttemptsCount = 0
+			return false
+		end
+	else
+		jumpAttemptsCount = 0
+		return true
+	end
+end
+
+local function IsTargetLookingAtMe(target)
+	local targetRoot = target.Character:FindFirstChild("HumanoidRootPart")
+	if not targetRoot then return false end
+	local distance = (targetRoot.Position - HumanoidRootPart.Position).Magnitude
+	if distance > LOOK_DETECTION_RADIUS then 
+		return false 
+	end
+	local toLocal = (HumanoidRootPart.Position - targetRoot.Position).Unit
+	local targetLook = targetRoot.CFrame.LookVector
+	local angle = math.acos(toLocal:Dot(targetLook))
+	local angleInDegrees = math.deg(angle)
+	local isLooking = angle < LOOK_ANGLE_THRESHOLD
+
+	return isLooking
+end
+
+local function GetPositionBehindTarget(target)
+	local targetRoot = target.Character:FindFirstChild("HumanoidRootPart")
+	if not targetRoot then return nil end
+	local targetCFrame = targetRoot.CFrame
+	return targetCFrame.Position - (targetCFrame.LookVector * BACK_DISTANCE)
+end
+
+local function GetPositionInFrontOfTarget(target)
+	local targetRoot = target.Character:FindFirstChild("HumanoidRootPart")
+	if not targetRoot then return nil end
+	local targetCFrame = targetRoot.CFrame
+	return targetCFrame.Position + (targetCFrame.LookVector * FRONT_DISTANCE)
+end
+
+local function GetRandomPositionInRadius(centerPosition)
+	if not centerPosition then return nil end
+	local angle = math.random() * math.pi
+	local distance = math.random() * RADIUS
+	local offset = Vector3.new(
+		math.cos(angle) * distance,
+		0,
+		math.sin(angle) * distance
+	)
+	return centerPosition + offset
+end
+
+local function GetClosePosition(target)
+	local targetRoot = target.Character:FindFirstChild("HumanoidRootPart")
+	if not targetRoot then return nil end
+	local randomDistance = CLOSE_DISTANCE_MIN + (math.random() * (CLOSE_DISTANCE_MAX - CLOSE_DISTANCE_MIN))
+	local targetPos = targetRoot.Position
+	local myPos = HumanoidRootPart.Position
+	local direction = (targetPos - myPos).Unit
+	return targetPos - (direction * randomDistance)
+end
+
+local function PerformInchMovement(target, backwards)
+	if not BEHAVIORS.ENABLE_INCHING then return end
+	if inchingInProgress then return end
+	local targetRoot = target.Character:FindFirstChild("HumanoidRootPart")
+	if not targetRoot then return end
+	local currentDistance = (targetRoot.Position - HumanoidRootPart.Position).Magnitude
+	if backwards then
+		if currentDistance >= BACKWARDS_MINIMUM_DISTANCE then return end
+		local direction = (HumanoidRootPart.Position - targetRoot.Position).Unit
+		local moveAmount = math.min(BACKWARDS_INCH_AMOUNT, BACKWARDS_MINIMUM_DISTANCE - currentDistance)
+		local newPosition = HumanoidRootPart.Position + (direction * moveAmount)
+		inchingInProgress = true
+		Humanoid.WalkToPoint = newPosition
+	else
+		if currentDistance <= MINIMUM_DISTANCE_TO_TARGET then return end
+		local direction = (targetRoot.Position - HumanoidRootPart.Position).Unit
+		local moveAmount = math.min(INCH_AMOUNT, currentDistance - MINIMUM_DISTANCE_TO_TARGET)
+		local newPosition = HumanoidRootPart.Position + (direction * moveAmount)
+		inchingInProgress = true
+		Humanoid.WalkToPoint = newPosition
+	end
+	local startTime = tick()
+	while (HumanoidRootPart.Position - Humanoid.WalkToPoint).Magnitude > 0.5 do
+		if tick() - startTime > 1 then break end
+		task.wait()
+	end
+	inchingInProgress = false
+	lastInchTime = tick()
+	task.wait(0.1)
+end
+
+local function StartInching(backwards)
+	if not BEHAVIORS.ENABLE_INCHING then return end
+	if isInchingEnabled then return end
+	isInchingEnabled = true
+	local initialWaitTime = INITIAL_WAIT_MIN + (math.random() * (INITIAL_WAIT_MAX - INITIAL_WAIT_MIN))
+	task.wait(initialWaitTime)
+	task.spawn(function()
+		while isInchingEnabled do
+			local nearestPlayer = GetNearestPlayer()
+			if nearestPlayer and IsTargetLookingAtMe(nearestPlayer) then
+				local timeSinceLastInch = tick() - lastInchTime
+				local randomInterval = INCH_INTERVAL_MIN + (math.random() * (INCH_INTERVAL_MAX - INCH_INTERVAL_MIN))
+				if timeSinceLastInch >= randomInterval then
+					PerformInchMovement(nearestPlayer, backwards)
+				end
+			end
+			task.wait(0.1)
+		end
+	end)
+end
+
+local function StopInching()
+	isInchingEnabled = false
+end
+
+local function MoveToPosition(position)
+	if not position or isMoving then return end
+	isMoving = true
+	Humanoid.WalkToPoint = position
+	local startTime = tick()
+	local timeout = 0.08
+	while (HumanoidRootPart.Position - position).Magnitude > 0.5 do
+		if tick() - startTime > timeout then
+			break
+		end
+		task.wait()
+	end
+	isMoving = false
+end
+
+local function StartFrontMovement()
+	if not BEHAVIORS.ENABLE_FRONT_MOVEMENT then return end
+	if isFrontMovementEnabled then return end
+	isFrontMovementEnabled = true
+	task.spawn(function()
+		while isFrontMovementEnabled do
+			local nearestPlayer = GetNearestPlayer()
+			if nearestPlayer and IsTargetLookingAtMe(nearestPlayer) then
+				local frontPosition = GetPositionInFrontOfTarget(nearestPlayer)
+				local targetPosition = GetRandomPositionInRadius(frontPosition)
+				if targetPosition then
+					MoveToPosition(targetPosition)
+				end
+				local closePosition = GetClosePosition(nearestPlayer)
+				if closePosition then
+					MoveToPosition(closePosition)
+				end
+			end
+			task.wait(timeout)
+		end
+	end)
+end
+
+local function StopFrontMovement()
+	isFrontMovementEnabled = false
+end
+
+local function StartBackMovement()
+	if not BEHAVIORS.ENABLE_BACK_MOVEMENT then return end
+	if isMovingBack then return end
+	isMovingBack = true
+	task.spawn(function()
+		while isMovingBack do
+			local nearestPlayer = GetNearestPlayer()
+			if nearestPlayer then
+				local behindPosition = GetPositionBehindTarget(nearestPlayer)
+				local targetPosition = GetRandomPositionInRadius(behindPosition)
+				if targetPosition then
+					MoveToPosition(targetPosition)
+				end
+				local closePosition = GetClosePosition(nearestPlayer)
+				if closePosition then
+					MoveToPosition(closePosition)
+				end
+			end
+			task.wait(timeout)
+		end
+	end)
+end
+
+local function StopBackMovement()
+	isMovingBack = false
+end
+
+local function PerformHeadNod()
+	if not BEHAVIORS.ENABLE_HEAD_NODDING then return end
+	if isHeadNodding then return end
+	isHeadNodding = true
+	headNodStartTime = tick()
+	task.spawn(function()
+		local startCFrame = bodyGyro.CFrame
+		while isHeadNodding and tick() - headNodStartTime < HEAD_NOD_DURATION do
+			local alpha = (tick() - headNodStartTime) * HEAD_NOD_SPEED
+			local angle = math.sin(alpha) * HEAD_NOD_ANGLE
+			bodyGyro.CFrame = startCFrame * CFrame.Angles(angle, 0, 0)
+			task.wait()
+		end
+		isHeadNodding = false
+		bodyGyro.CFrame = startCFrame
+	end)
+end
+
+local function TrackTargetMovement(target)
+	if not BEHAVIORS.ENABLE_PATTERN_DETECTION then return end
+	if not target or not target.Character then return end
+	local targetRoot = target.Character:FindFirstChild("HumanoidRootPart")
+	if not targetRoot then return end
+	local currentPosition = targetRoot.Position
+	if lastTargetPosition then
+		local distanceMoved = (currentPosition - lastTargetPosition).Magnitude
+		table.insert(movementHistory, distanceMoved)
+		if #movementHistory > MOVEMENT_HISTORY_LENGTH then
+			table.remove(movementHistory, 1)
+		end
+		if distanceMoved >= SMALL_MOVEMENT_RANGE.min and distanceMoved <= SMALL_MOVEMENT_RANGE.max then
+			smallRangeCount = smallRangeCount + 1
+		elseif distanceMoved >= LARGE_MOVEMENT_RANGE.min and distanceMoved <= LARGE_MOVEMENT_RANGE.max then
+			largeRangeCount = largeRangeCount + 1
+		end
+		if distanceMoved < SMALL_MOVEMENT_RANGE.min or distanceMoved > LARGE_MOVEMENT_RANGE.max then
+			smallRangeCount = 0
+			largeRangeCount = 0
+		end
+		if smallRangeCount >= PATTERN_DETECTION_THRESHOLD or largeRangeCount >= PATTERN_DETECTION_THRESHOLD then
+			smallRangeCount = 0
+			largeRangeCount = 0
+			StartFrontMovement()
+		end
+	end
+	lastTargetPosition = currentPosition
+end
+
+
+local function EvaluateBehaviors()
+	local nearestPlayer = GetNearestPlayer()
+	if not nearestPlayer then return end
+	local isBeingLookedAt = IsTargetLookingAtMe(nearestPlayer)
+	if isBeingLookedAt then
+		if math.random() <= REACTION_CHANCE then
+			if math.random() <= FRONT_MOVEMENT_CHANCE and BEHAVIORS.ENABLE_FRONT_MOVEMENT then
+				StopInching()
+				StopBackMovement()
+				StartFrontMovement()
+			else
+				StopFrontMovement()
+				StopBackMovement()
+				isReverseBehavior = math.random() <= REVERSE_BEHAVIOR_CHANCE
+				if isReverseBehavior then
+				end
+				StartInching(isReverseBehavior)
+			end
+			if math.random() <= HEAD_NOD_CHANCE and not isHeadNodding and BEHAVIORS.ENABLE_HEAD_NODDING then
+				PerformHeadNod()
+			end
+		end
+	else
+		StopInching()
+		StopFrontMovement()
+		StartBackMovement()
+	end
+end
+
+RunService.Heartbeat:Connect(function() --no you don't see what i'm trying to do
+	if not Humanoid or Humanoid.Health <= 0 then return end
+	HandleSeatedState()
+
+	local nearestPlayer = GetNearestPlayer()
+	if not nearestPlayer then 
+		if currentBehaviorState ~= "idle" then
+			currentBehaviorState = "idle"
+		end
+		bodyGyro.CFrame = HumanoidRootPart.CFrame
+		StopInching()
+		StopFrontMovement()
+		StopBackMovement()
+		UnequipCurrentItem()
+		return 
+	end
+	if isMoving or inchingInProgress then
+		CheckForObstacles()
+	end
+	if tick() - lastMovementCheck >= MOVEMENT_CHECK_INTERVAL then
+		TrackTargetMovement(nearestPlayer)
+		lastMovementCheck = tick()
+	end
+	local targetRoot = nearestPlayer.Character:FindFirstChild("HumanoidRootPart")
+	if not targetRoot then return end
+	local isBeingLookedAt = IsTargetLookingAtMe(nearestPlayer)
+	if isBeingLookedAt then
+		if not beingLookedAt then
+			beingLookedAt = true
+			EvaluateBehaviors()
+		end
+
+		ItemHandler()
+
+		if not isHeadNodding then
+			if isFrontMovementEnabled then
+				if currentBehaviorState ~= "front_movement" then
+					currentBehaviorState = "front_movement"
+				end
+				local awayDir = (HumanoidRootPart.Position - targetRoot.Position).Unit
+				local awayPos = HumanoidRootPart.Position + awayDir
+				bodyGyro.CFrame = CFrame.new(HumanoidRootPart.Position, Vector3.new(awayPos.X, HumanoidRootPart.Position.Y, awayPos.Z))
+			elseif isReverseBehavior then
+				if currentBehaviorState ~= "reverse_behavior" then
+					currentBehaviorState = "reverse_behavior"
+				end
+				local targetPos = targetRoot.Position
+				bodyGyro.CFrame = CFrame.new(HumanoidRootPart.Position, Vector3.new(targetPos.X, HumanoidRootPart.Position.Y, targetPos.Z))
+			else
+				if currentBehaviorState ~= "standard_away" then
+					currentBehaviorState = "standard_away"
+				end
+				local awayDir = (HumanoidRootPart.Position - targetRoot.Position).Unit
+				local awayPos = HumanoidRootPart.Position + awayDir
+				bodyGyro.CFrame = CFrame.new(HumanoidRootPart.Position, Vector3.new(awayPos.X, HumanoidRootPart.Position.Y, awayPos.Z))
+			end
+		end
+	else
+		if beingLookedAt then
+			beingLookedAt = false
+			isReverseBehavior = false
+			isHeadNodding = false
+			StopInching()
+			StopFrontMovement()
+			StopBackMovement()
+			UnequipCurrentItem()
+		end
+
+		if not isHeadNodding then
+			if currentBehaviorState ~= "following" then
+				currentBehaviorState = "following"
+			end
+			local targetPos = targetRoot.Position
+			bodyGyro.CFrame = CFrame.new(HumanoidRootPart.Position, Vector3.new(targetPos.X, HumanoidRootPart.Position.Y, targetPos.Z))
+		end
+
+		if isMoving or inchingInProgress then return end
+		StartBackMovement()
+	end
+end)
+
+LocalPlayer.CharacterAdded:Connect(function(newCharacter)
+	repeat
+		task.wait()
+	until newCharacter:FindFirstChild("HumanoidRootPart")
+	Character, Humanoid, HumanoidRootPart = GetCharacterComponents()
+	bodyGyro:Destroy()
+	bodyGyro = Instance.new("BodyGyro")
+	bodyGyro.MaxTorque = Vector3.new(0, math.huge, 0)
+	bodyGyro.P = 10000
+	bodyGyro.D = 100
+	bodyGyro.Parent = HumanoidRootPart
+
+	isMovingBack = true
+	isMoving = false
+	beingLookedAt = false
+	isInchingEnabled = false
+	isFrontMovementEnabled = false
+	inchingInProgress = false
+	isHeadNodding = false
+	currentEquippedItem = nil
+	lastItemSwitch = 0
+	isReverseBehavior = false
+	movementHistory = {}
+	smallRangeCount = 0
+	largeRangeCount = 0
+	lastTargetPosition = nil
+	lastJumpAttempt = 0
+	jumpAttemptsCount = 0
+	currentTarget = nil
+	lastVisibilityCheck = 0
+end)
